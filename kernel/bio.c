@@ -22,16 +22,21 @@
 #include "defs.h"
 #include "fs.h"
 #include "buf.h"
+#define NBUC 13
 
 struct {
   struct spinlock lock;
   struct buf buf[NBUF];
 
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
 } bcache;
+
+struct bMem
+{
+  struct spinlock lock;
+  struct buf head;
+};
+
+static struct bMem hashTable[NBUC];
 
 void
 binit(void)
@@ -40,18 +45,22 @@ binit(void)
 
   initlock(&bcache.lock, "bcache");
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+  for (int i = 0; i < NBUC; i++) {
+    initlock(&(hashTable[i].lock), "bcache.bucket");
   }
+    for (b = bcache.buf; b < bcache.buf + NBUF; b++)
+    {
+      initsleeplock(&b->lock, "buffer");
+    }
 }
 
+void replaceBuffer(struct buf *lruBuf, uint dev, uint blockno, uint ticks) {
+  lruBuf->dev = dev;
+  lruBuf->blockno = blockno;
+  lruBuf->valid = 0;
+  lruBuf->refcnt = 1;
+  lruBuf->tick = ticks;
+}
 // Look through buffer cache for block on device dev.
 // If not found, allocate a buffer.
 // In either case, return locked buffer.
@@ -121,33 +130,26 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  uint64 num = b->blockno % NBUC;
+  acquire(&(hashTable[num].lock));
   b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
-  
-  release(&bcache.lock);
+  release(&(hashTable[num].lock));
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  uint64 num = b->blockno % NBUC;
+  acquire(&(hashTable[num].lock));
   b->refcnt++;
-  release(&bcache.lock);
+  release(&(hashTable[num].lock));
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
-  b->refcnt--;
-  release(&bcache.lock);
+  uint64 num = b->blockno % NBUC;
+  acquire(&(hashTable[num].lock));
+  b->refcnt--
+  release(&(hashTable[num].lock));
 }
 
 
